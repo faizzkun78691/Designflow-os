@@ -1,0 +1,115 @@
+-- ============================================================================
+-- DESIGNFLOW OS — PHASE 4 (009): Fix calculate_designer_score column name.
+-- task_assignments uses responded_at (not accepted_at).
+-- ============================================================================
+create or replace function public.calculate_designer_score(
+  p_designer_id uuid,
+  p_start date,
+  p_end   date
+)
+returns jsonb
+language plpgsql security definer set search_path = public as $$
+declare
+  v_role      public.app_role;
+  v_total_sub integer;
+  v_approved  integer;
+  v_avg_rev   numeric;
+  v_on_time   numeric;
+  v_output_raw numeric;
+  v_accepted  integer;
+  v_completed integer;
+  v_ack_total integer;
+  v_ack_fast  integer;
+  v_quality   numeric;
+  v_ontime    numeric;
+  v_output    numeric;
+  v_reliab    numeric;
+  v_respons   numeric;
+  v_total     numeric;
+  v_eligible  boolean;
+begin
+  v_role := public._caller_role();
+  if v_role = 'designer' and p_designer_id <> auth.uid() then
+    raise exception 'Designers may only view their own score.';
+  end if;
+  if v_role = 'team_lead' then
+    perform 1 from public.tasks t
+     where (t.created_by = auth.uid() or t.assigned_lead_id = auth.uid())
+       and (t.assigned_designer_id = p_designer_id or t.claimed_by = p_designer_id)
+     limit 1;
+    if not found then raise exception 'Designer is outside your authorized scope.'; end if;
+  end if;
+  if v_role not in ('designer','team_lead','organizer','social_media_manager') then
+    raise exception 'Not authorized.';
+  end if;
+
+  select count(*), count(*) filter (where status = 'approved')
+    into v_total_sub, v_approved
+    from public.task_submissions
+   where designer_id = p_designer_id
+     and submitted_at::date between p_start and p_end;
+
+  select coalesce(avg(c.cnt), 0) into v_avg_rev from (
+    select s.id, count(rr.id) as cnt
+      from public.task_submissions s
+      left join public.revision_requests rr on rr.submission_id = s.id
+     where s.designer_id = p_designer_id
+       and s.submitted_at::date between p_start and p_end
+     group by s.id) c;
+
+  select coalesce(avg(case when s.submitted_at <= t.due_date then 1.0 else 0.0 end), 0) * 100
+    into v_on_time
+    from public.task_submissions s join public.tasks t on t.id = s.task_id
+   where s.designer_id = p_designer_id
+     and s.submitted_at::date between p_start and p_end
+     and t.due_date is not null;
+
+  select coalesce(sum(w.weight), 0) into v_output_raw
+    from public.task_submissions s
+    join public.tasks t on t.id = s.task_id
+    left join public.task_complexity_weights w
+      on lower(w.difficulty) = lower(coalesce(t.difficulty, 'medium'))
+   where s.designer_id = p_designer_id and s.status = 'approved'
+     and s.submitted_at::date between p_start and p_end;
+
+  select count(*) into v_accepted
+    from public.tasks
+   where (assigned_designer_id = p_designer_id or claimed_by = p_designer_id)
+     and created_at::date between p_start and p_end;
+
+  select count(*) into v_completed
+    from public.tasks
+   where (assigned_designer_id = p_designer_id or claimed_by = p_designer_id)
+     and production_status = 'published'
+     and created_at::date between p_start and p_end;
+
+  select count(*),
+         count(*) filter (where status = 'accepted' and responded_at is not null
+                          and responded_at <= created_at + interval '24 hours')
+    into v_ack_total, v_ack_fast
+    from public.task_assignments
+   where assignee_id = p_designer_id
+     and created_at::date between p_start and p_end;
+
+  v_eligible := v_total_sub >= 3;
+
+  v_quality := greatest(coalesce(v_approved::numeric / nullif(v_total_sub, 0), 0) * 100 - least(v_avg_rev * 10, 40), 0);
+  v_ontime  := coalesce(v_on_time, 0);
+  v_output  := least(coalesce(v_output_raw, 0) / 10 * 100, 100);
+  v_reliab  := coalesce(v_completed::numeric / nullif(v_accepted, 0), 0) * 100;
+  v_respons := coalesce(v_ack_fast::numeric / nullif(v_ack_total, 0), 0) * 100;
+  v_total   := round(0.30 * v_quality + 0.25 * v_ontime + 0.20 * v_output
+                   + 0.15 * v_reliab + 0.10 * v_respons, 1);
+
+  return jsonb_build_object(
+    'designer_id', p_designer_id,
+    'period_start', p_start, 'period_end', p_end,
+    'eligible', v_eligible,
+    'quality', round(v_quality, 1), 'on_time', round(v_ontime, 1),
+    'output', round(v_output, 1), 'reliability', round(v_reliab, 1),
+    'responsiveness', round(v_respons, 1),
+    'total_score', case when v_eligible then v_total else null end,
+    'sample_tasks', v_total_sub
+  );
+end
+$$;
